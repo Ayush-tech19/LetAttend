@@ -1,0 +1,32 @@
+[
+    {
+        "student_id": "student_001",
+        "college_id": "101",
+        "name": "Aaditya Sharma",
+        "college_name": "CPU"
+    },
+    {
+        "student_id": "student_002",
+        "college_id": "102",
+        "name": "Aayush Suwalka",
+        "college_name": "CPU"
+    },
+    {
+        "student_id": "student_003",
+        "college_id": "103",
+        "name": "Bharat Goswami",
+        "college_name": "CPU"
+    },
+    {
+        "student_id": "student_004",
+        "college_id": "104",
+        "name": "Pranav Sharma",
+        "college_name": "CPU"
+    },
+    {
+        "student_id": "student_005",
+        "college_id": "105",
+        "name": "Pulkit Sharma",
+        "college_name": "CPU"
+    }
+]

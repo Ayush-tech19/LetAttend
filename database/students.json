@@ -1,0 +1,18 @@
+[
+    {
+        "student_id": "k26047",
+        "college_id": "k26047",
+        "name": "Ayush suwalka",
+        "branch": "CSE",
+        "year": "3rd Year",
+        "section": "A",
+        "photos": [
+            "C:\\CNN_MODEL\\student_faces\\k26047\\photo_1.jpg",
+            "C:\\CNN_MODEL\\student_faces\\k26047\\photo_2.jpg",
+            "C:\\CNN_MODEL\\student_faces\\k26047\\photo_3.jpg",
+            "C:\\CNN_MODEL\\student_faces\\k26047\\photo_4.jpg",
+            "C:\\CNN_MODEL\\student_faces\\k26047\\photo_5.jpg"
+        ],
+        "registered_at": "2026-10-04 21:05:11"
+    }
+]
