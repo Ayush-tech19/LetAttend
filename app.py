@@ -35,7 +35,7 @@ EXCEL_FILE = os.path.join(
 # ============================================================
 
 # Strict enough to reduce false positives
-RECOGNITION_THRESHOLD = 0.50
+RECOGNITION_THRESHOLD = 0.40
 
 MIN_REGISTRATION_PHOTOS = 3
 MAX_REGISTRATION_PHOTOS = 5
