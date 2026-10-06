@@ -2,3 +2,4 @@ streamlit==1.65.0
 opencv-python-headless
 numpy
 openpyxl
+Pillow

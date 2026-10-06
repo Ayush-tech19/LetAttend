@@ -1,4 +1,8 @@
 venv/
 __pycache__/
 *.pyc
-.streamlit/secrets.toml
+
+database/students.json
+model/embeddings.json
+Attendance/Attendance.xlsx
+student_faces/
