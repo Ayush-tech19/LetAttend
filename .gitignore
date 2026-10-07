@@ -2,7 +2,11 @@ venv/
 __pycache__/
 *.pyc
 
-database/students.json
-model/embeddings.json
-Attendance/Attendance.xlsx
-student_faces/
+# Local attendance data
+/data/
+/Attendance/Attendance.xlsx
+/database/students.json
+/model/embeddings.json
+/student_faces/
+
+.streamlit/secrets.toml

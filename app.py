@@ -1,13 +1,15 @@
 import os
 import io
 import json
+import sqlite3
+import hashlib
+from datetime import date, datetime
+
 import cv2
 import numpy as np
 import streamlit as st
-
-from datetime import date
 from PIL import Image, ImageOps
-from openpyxl import Workbook, load_workbook
+from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 
 
@@ -17,34 +19,37 @@ from openpyxl.styles import Font, Alignment
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, "model")
-DATABASE_DIR = os.path.join(BASE_DIR, "database")
+DATA_DIR = os.path.join(BASE_DIR, "data")
 ATTENDANCE_DIR = os.path.join(BASE_DIR, "Attendance")
 
 YUNET_PATH = os.path.join(MODEL_DIR, "yunet.onnx")
 SFACE_PATH = os.path.join(MODEL_DIR, "sface.onnx")
-STUDENTS_FILE = os.path.join(DATABASE_DIR, "students.json")
-EMBEDDINGS_FILE = os.path.join(MODEL_DIR, "embeddings.json")
-EXCEL_FILE = os.path.join(ATTENDANCE_DIR, "Attendance.xlsx")
+DB_PATH = os.path.join(DATA_DIR, "attendance.db")
+EXCEL_PATH = os.path.join(ATTENDANCE_DIR, "Attendance.xlsx")
+
+os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(ATTENDANCE_DIR, exist_ok=True)
 
 
 # ============================================================
 # SETTINGS
 # ============================================================
 
-# Lower than the old detector setting so normal mobile faces are
-# less likely to be missed.
-DETECTION_SCORE_THRESHOLD = 0.45
+DETECTION_THRESHOLD = 0.45
 NMS_THRESHOLD = 0.30
+TOP_K = 5000
 
 # SFace cosine-similarity acceptance boundary.
+# This is an experimentally selected project setting, not a
+# universal SFace constant.
 RECOGNITION_THRESHOLD = 0.45
+MIN_SCORE_MARGIN = 0.03
 
-# Extra protection when two registered students get very close scores.
-MIN_MATCH_MARGIN = 0.03
-
-MIN_REGISTRATION_PHOTOS = 3
-MAX_REGISTRATION_PHOTOS = 5
+# The requested registration flow uses exactly five camera photos.
+REGISTRATION_PHOTOS = 5
 MAX_IMAGE_SIDE = 1600
+MIN_REGISTRATION_FACE_SIZE = 55
 
 
 # ============================================================
@@ -52,113 +57,401 @@ MAX_IMAGE_SIDE = 1600
 # ============================================================
 
 st.set_page_config(
-    page_title="College Attendance System",
+    page_title="Smart Attendance System",
     page_icon="🎓",
     layout="wide"
 )
 
 
 # ============================================================
-# DIRECTORIES + EMPTY DATABASE
+# SQLITE DATABASE
 # ============================================================
 
-os.makedirs(MODEL_DIR, exist_ok=True)
-os.makedirs(DATABASE_DIR, exist_ok=True)
-os.makedirs(ATTENDANCE_DIR, exist_ok=True)
-
-if not os.path.exists(STUDENTS_FILE):
-    with open(STUDENTS_FILE, "w", encoding="utf-8") as f:
-        json.dump([], f, indent=4)
-
-if not os.path.exists(EMBEDDINGS_FILE):
-    with open(EMBEDDINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump({}, f, indent=4)
-
-
-# ============================================================
-# LOAD YUNET + SFACE
-# ============================================================
-
-@st.cache_resource
-def load_models():
-    if not os.path.exists(YUNET_PATH):
-        raise FileNotFoundError(f"Missing model file: {YUNET_PATH}")
-
-    if not os.path.exists(SFACE_PATH):
-        raise FileNotFoundError(f"Missing model file: {SFACE_PATH}")
-
-    detector = cv2.FaceDetectorYN.create(
-        YUNET_PATH,
-        "",
-        (320, 320),
-        DETECTION_SCORE_THRESHOLD,
-        NMS_THRESHOLD,
-        5000
+def db_connection():
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+        check_same_thread=False
     )
-
-    recognizer = cv2.FaceRecognizerSF.create(
-        SFACE_PATH,
-        ""
-    )
-
-    return detector, recognizer
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    return conn
 
 
-try:
-    detector, recognizer = load_models()
-except Exception as e:
-    st.error("Face recognition models could not be loaded.")
-    st.code(str(e))
-    st.stop()
-
-
-# ============================================================
-# DATABASE HELPERS
-# ============================================================
-
-def load_students():
+def initialize_database():
+    conn = db_connection()
     try:
-        with open(STUDENTS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS students (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                college_id TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                year TEXT NOT NULL,
+                branch TEXT DEFAULT '',
+                section TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS face_embeddings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_id INTEGER NOT NULL,
+                embedding TEXT NOT NULL,
+                FOREIGN KEY(student_id)
+                    REFERENCES students(id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS attendance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_id INTEGER NOT NULL,
+                attendance_date TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PRESENT',
+                similarity REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                UNIQUE(student_id, attendance_date),
+                FOREIGN KEY(student_id)
+                    REFERENCES students(id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
-def save_students(students):
-    with open(STUDENTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(students, f, indent=4, ensure_ascii=False)
-
-
-def load_embeddings():
-    try:
-        with open(EMBEDDINGS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def save_embeddings(embeddings):
-    with open(EMBEDDINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(embeddings, f, indent=4)
+initialize_database()
 
 
 # ============================================================
-# IMAGE HELPERS
+# DATABASE FUNCTIONS
+# ============================================================
+
+def get_students():
+    conn = db_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, college_id, name, year, branch, section, created_at
+            FROM students
+            ORDER BY id
+            """
+        ).fetchall()
+
+        return [
+            {
+                "id": row[0],
+                "college_id": row[1],
+                "name": row[2],
+                "year": row[3],
+                "branch": row[4] or "",
+                "section": row[5] or "",
+                "created_at": row[6]
+            }
+            for row in rows
+        ]
+    finally:
+        conn.close()
+
+
+def get_student(student_id):
+    conn = db_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT id, college_id, name, year, branch, section, created_at
+            FROM students
+            WHERE id = ?
+            """,
+            (int(student_id),)
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        return {
+            "id": row[0],
+            "college_id": row[1],
+            "name": row[2],
+            "year": row[3],
+            "branch": row[4] or "",
+            "section": row[5] or "",
+            "created_at": row[6]
+        }
+    finally:
+        conn.close()
+
+
+def college_id_exists(college_id):
+    conn = db_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM students WHERE lower(college_id)=lower(?) LIMIT 1",
+            (college_id,)
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def get_all_embeddings():
+    conn = db_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT student_id, embedding
+            FROM face_embeddings
+            ORDER BY student_id, id
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    result = {}
+    for student_id, embedding_text in rows:
+        try:
+            result.setdefault(int(student_id), []).append(
+                json.loads(embedding_text)
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return result
+
+
+def save_student(college_id, name, year, branch, section, embeddings):
+    conn = db_connection()
+    try:
+        conn.execute("BEGIN")
+
+        cursor = conn.execute(
+            """
+            INSERT INTO students
+            (college_id, name, year, branch, section, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                college_id,
+                name,
+                year,
+                branch,
+                section,
+                datetime.now().isoformat(timespec="seconds")
+            )
+        )
+
+        student_id = int(cursor.lastrowid)
+
+        for embedding in embeddings:
+            conn.execute(
+                """
+                INSERT INTO face_embeddings(student_id, embedding)
+                VALUES (?, ?)
+                """,
+                (student_id, json.dumps(embedding))
+            )
+
+        conn.commit()
+        return student_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def mark_present(student_id, attendance_date, similarity):
+    conn = db_connection()
+    try:
+        now = datetime.now().isoformat(timespec="seconds")
+
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO attendance
+            (student_id, attendance_date, status, similarity, created_at)
+            VALUES (?, ?, 'PRESENT', ?, ?)
+            """,
+            (
+                int(student_id),
+                attendance_date,
+                float(similarity),
+                now
+            )
+        )
+
+        if cursor.rowcount == 1:
+            conn.commit()
+            return "NEW"
+
+        # Keep the strongest score if the same student is detected again.
+        conn.execute(
+            """
+            UPDATE attendance
+            SET similarity = CASE
+                WHEN similarity < ? THEN ?
+                ELSE similarity
+            END
+            WHERE student_id = ? AND attendance_date = ?
+            """,
+            (
+                float(similarity),
+                float(similarity),
+                int(student_id),
+                attendance_date
+            )
+        )
+        conn.commit()
+        return "ALREADY"
+    finally:
+        conn.close()
+
+
+def get_today_attendance():
+    today = date.today().isoformat()
+    conn = db_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT student_id, status, similarity
+            FROM attendance
+            WHERE attendance_date = ?
+            """,
+            (today,)
+        ).fetchall()
+        return {
+            int(row[0]): {
+                "status": row[1],
+                "similarity": row[2]
+            }
+            for row in rows
+        }
+    finally:
+        conn.close()
+
+
+def get_attendance_records():
+    conn = db_connection()
+    try:
+        return conn.execute(
+            """
+            SELECT
+                s.college_id,
+                s.name,
+                s.year,
+                s.branch,
+                s.section,
+                a.attendance_date,
+                a.status,
+                a.similarity
+            FROM attendance a
+            INNER JOIN students s ON s.id = a.student_id
+            ORDER BY a.attendance_date DESC, s.name
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+# ============================================================
+# EXCEL REBUILD
+# ============================================================
+
+def rebuild_excel():
+    """Create Excel from SQLite so Excel cannot become a second database."""
+    students = get_students()
+    records = get_attendance_records()
+
+    dates = sorted({row[5] for row in records})
+    attendance_map = {
+        (row[0], row[5]): row[6]
+        for row in records
+    }
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Attendance"
+
+    headers = [
+        "College ID",
+        "Name",
+        "Year",
+        "Branch",
+        "Section"
+    ] + dates
+
+    ws.append(headers)
+
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+
+    for student in students:
+        row = [
+            student["college_id"],
+            student["name"],
+            student["year"],
+            student["branch"],
+            student["section"]
+        ]
+
+        for attendance_date in dates:
+            row.append(
+                attendance_map.get(
+                    (student["college_id"], attendance_date),
+                    ""
+                )
+            )
+
+        ws.append(row)
+
+    fixed_widths = {
+        1: 16,
+        2: 25,
+        3: 14,
+        4: 18,
+        5: 14
+    }
+
+    for column_index, width in fixed_widths.items():
+        ws.column_dimensions[
+            ws.cell(row=1, column=column_index).column_letter
+        ].width = width
+
+    for column_index in range(6, ws.max_column + 1):
+        ws.column_dimensions[
+            ws.cell(row=1, column=column_index).column_letter
+        ].width = 14
+
+    try:
+        wb.save(EXCEL_PATH)
+        return True, None
+    except PermissionError:
+        return False, (
+            "Attendance.xlsx is open. Close Excel and try again. "
+            "The database has still been updated safely."
+        )
+
+
+# ============================================================
+# IMAGE FUNCTIONS
 # ============================================================
 
 def prepare_image(file_bytes):
-    """
-    Corrects mobile EXIF orientation, converts to OpenCV BGR,
-    and resizes very large photos for stable processing.
-    """
+    """Read mobile images with EXIF rotation handled correctly."""
     try:
         pil_image = Image.open(io.BytesIO(file_bytes))
         pil_image = ImageOps.exif_transpose(pil_image)
         pil_image = pil_image.convert("RGB")
 
-        rgb = np.array(pil_image)
+        rgb = np.asarray(pil_image)
         image = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
         height, width = image.shape[:2]
@@ -186,22 +479,36 @@ def detect_faces(image):
     return [] if faces is None else list(faces)
 
 
-# ============================================================
-# CREATE SFace EMBEDDING FOR REGISTRATION
-# ============================================================
-
 def create_embedding(image):
-    """Create one embedding from a single-person registration image."""
+    """Registration requires exactly one usable face in the photo."""
     faces = detect_faces(image)
 
     if len(faces) == 0:
-        return None, "No face detected. Move closer, face the camera, and try again."
+        return None, (
+            "No face detected. Move closer, keep your full face visible, "
+            "and use good lighting."
+        )
 
     if len(faces) > 1:
-        return None, "Multiple faces detected. Only one person is allowed in a registration photo."
+        return None, (
+            "More than one face detected. Only one person is allowed "
+            "in each registration photo."
+        )
+
+    face = faces[0]
+    face_width = float(face[2])
+    face_height = float(face[3])
+
+    if (
+        face_width < MIN_REGISTRATION_FACE_SIZE
+        or face_height < MIN_REGISTRATION_FACE_SIZE
+    ):
+        return None, (
+            "Face is too small. Move closer to the camera and retake the photo."
+        )
 
     try:
-        aligned = recognizer.alignCrop(image, faces[0])
+        aligned = recognizer.alignCrop(image, face)
         feature = recognizer.feature(aligned).astype(np.float32)
         return feature.flatten().tolist(), None
     except Exception as e:
@@ -224,20 +531,16 @@ def normalize_embedding(value):
     return []
 
 
-def recognize_face(image, face, embeddings):
-    """
-    Compare one detected face against all registered embeddings.
-    Returns (student_id or None, best_score, second_best_score).
-    """
+def recognize_face(image, face, stored_embeddings):
     try:
         aligned = recognizer.alignCrop(image, face)
-        feature = recognizer.feature(aligned)
+        query_feature = recognizer.feature(aligned)
     except Exception:
         return None, 0.0, -1.0
 
-    student_best_scores = []
+    student_scores = []
 
-    for student_id, stored in embeddings.items():
+    for student_id, stored in stored_embeddings.items():
         references = normalize_embedding(stored)
         if not references:
             continue
@@ -248,55 +551,58 @@ def recognize_face(image, face, embeddings):
             try:
                 score = float(
                     recognizer.match(
-                        feature,
+                        query_feature,
                         reference,
                         cv2.FaceRecognizerSF_FR_COSINE
                     )
                 )
-                best_for_student = max(best_for_student, score)
+                best_for_student = max(
+                    best_for_student,
+                    score
+                )
             except Exception:
-                pass
+                continue
 
         if best_for_student >= 0:
-            student_best_scores.append(
-                (student_id, best_for_student)
+            student_scores.append(
+                (int(student_id), best_for_student)
             )
 
-    if not student_best_scores:
+    if not student_scores:
         return None, 0.0, -1.0
 
-    student_best_scores.sort(
+    student_scores.sort(
         key=lambda item: item[1],
         reverse=True
     )
 
-    best_student, best_score = student_best_scores[0]
-    second_best_score = (
-        student_best_scores[1][1]
-        if len(student_best_scores) > 1
+    best_student, best_score = student_scores[0]
+    second_score = (
+        student_scores[1][1]
+        if len(student_scores) > 1
         else -1.0
     )
 
     margin_ok = (
-        second_best_score < 0
-        or best_score - second_best_score >= MIN_MATCH_MARGIN
+        second_score < 0
+        or best_score - second_score >= MIN_SCORE_MARGIN
     )
 
     if best_score >= RECOGNITION_THRESHOLD and margin_ok:
-        return best_student, best_score, second_best_score
+        return best_student, best_score, second_score
 
-    return None, best_score, second_best_score
+    return None, best_score, second_score
 
 
 # ============================================================
-# DRAW BOX + NAME
+# DRAW BOXES
 # ============================================================
 
 def draw_face_label(image, face, label, score=None):
-    x, y, w, h = [int(v) for v in face[:4]]
+    x, y, w, h = [int(float(v)) for v in face[:4]]
 
-    # Green for a recognized student, red for Unknown.
-    box_color = (0, 200, 0) if label != "Unknown" else (0, 0, 255)
+    known = label.strip().lower() != "unknown"
+    box_color = (0, 200, 0) if known else (0, 0, 255)
 
     cv2.rectangle(
         image,
@@ -306,11 +612,13 @@ def draw_face_label(image, face, label, score=None):
         3
     )
 
-    text = label if score is None else f"{label} ({score:.2f})"
+    text = label
+    if known and score is not None:
+        text = f"{label} ({score:.2f})"
+
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.65
     thickness = 2
-
     (tw, th), baseline = cv2.getTextSize(
         text,
         font,
@@ -318,12 +626,15 @@ def draw_face_label(image, face, label, score=None):
         thickness
     )
 
-    text_y = max(y, th + baseline + 10)
+    label_y = max(
+        y,
+        th + baseline + 10
+    )
 
     cv2.rectangle(
         image,
-        (x, text_y - th - baseline - 8),
-        (x + tw + 10, text_y + 4),
+        (x, label_y - th - baseline - 8),
+        (x + tw + 10, label_y + 4),
         box_color,
         -1
     )
@@ -331,7 +642,7 @@ def draw_face_label(image, face, label, score=None):
     cv2.putText(
         image,
         text,
-        (x + 5, text_y - 3),
+        (x + 5, label_y - 3),
         font,
         font_scale,
         (255, 255, 255),
@@ -341,131 +652,59 @@ def draw_face_label(image, face, label, score=None):
 
 
 # ============================================================
-# EXCEL
+# MODEL LOADING
 # ============================================================
 
-def create_excel(students):
-    if os.path.exists(EXCEL_FILE):
-        return
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Attendance"
-
-    headers = [
-        "College ID",
-        "Name",
-        "Branch",
-        "Year",
-        "Section"
-    ]
-    ws.append(headers)
-
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal="center")
-
-    for student in students:
-        ws.append([
-            student.get("college_id", ""),
-            student.get("name", ""),
-            student.get("branch", ""),
-            student.get("year", ""),
-            student.get("section", "")
-        ])
-
-    wb.save(EXCEL_FILE)
-
-
-def sync_students_to_excel(students):
-    create_excel(students)
-
-    wb = load_workbook(EXCEL_FILE)
-    ws = wb["Attendance"]
-    existing_ids = {}
-
-    for row in range(2, ws.max_row + 1):
-        college_id = ws.cell(row=row, column=1).value
-        if college_id:
-            existing_ids[str(college_id)] = row
-
-    for student in students:
-        college_id = str(student.get("college_id", ""))
-
-        if college_id in existing_ids:
-            continue
-
-        ws.append([
-            student.get("college_id", ""),
-            student.get("name", ""),
-            student.get("branch", ""),
-            student.get("year", ""),
-            student.get("section", "")
-        ])
-
-    wb.save(EXCEL_FILE)
-
-
-def save_attendance(recognized_students, students):
-    try:
-        sync_students_to_excel(students)
-        wb = load_workbook(EXCEL_FILE)
-        ws = wb["Attendance"]
-
-        today = date.today().strftime("%d-%m-%Y")
-        date_column = None
-
-        for col in range(1, ws.max_column + 1):
-            if ws.cell(row=1, column=col).value == today:
-                date_column = col
-                break
-
-        if date_column is None:
-            date_column = ws.max_column + 1
-            ws.cell(row=1, column=date_column).value = today
-            ws.cell(row=1, column=date_column).font = Font(bold=True)
-
-        row_map = {}
-        for row in range(2, ws.max_row + 1):
-            college_id = ws.cell(row=row, column=1).value
-            if college_id:
-                row_map[str(college_id)] = row
-
-        count = 0
-        for student in recognized_students.values():
-            college_id = str(student.get("college_id", ""))
-            if college_id in row_map:
-                ws.cell(
-                    row=row_map[college_id],
-                    column=date_column
-                ).value = "PRESENT"
-                count += 1
-
-        wb.save(EXCEL_FILE)
-        return True, count
-
-    except PermissionError:
-        return False, (
-            "Attendance.xlsx is open. "
-            "Close the Excel file and try again."
+@st.cache_resource
+def load_models():
+    if not os.path.exists(YUNET_PATH):
+        raise FileNotFoundError(
+            f"YuNet model not found: {YUNET_PATH}"
         )
-    except Exception as e:
-        return False, str(e)
+
+    if not os.path.exists(SFACE_PATH):
+        raise FileNotFoundError(
+            f"SFace model not found: {SFACE_PATH}"
+        )
+
+    detector = cv2.FaceDetectorYN.create(
+        YUNET_PATH,
+        "",
+        (320, 320),
+        DETECTION_THRESHOLD,
+        NMS_THRESHOLD,
+        TOP_K
+    )
+
+    recognizer = cv2.FaceRecognizerSF.create(
+        SFACE_PATH,
+        ""
+    )
+
+    return detector, recognizer
+
+
+try:
+    detector, recognizer = load_models()
+except Exception as e:
+    st.error("The YuNet/SFace models could not be loaded.")
+    st.code(str(e))
+    st.stop()
 
 
 # ============================================================
 # APP DATA
 # ============================================================
 
-students = load_students()
-embeddings = load_embeddings()
+students = get_students()
+stored_embeddings = get_all_embeddings()
 
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 
-st.sidebar.title("🎓 College Attendance")
+st.sidebar.title("🎓 Smart Attendance")
 
 page = st.sidebar.radio(
     "Menu",
@@ -478,48 +717,55 @@ page = st.sidebar.radio(
     ]
 )
 
+st.sidebar.divider()
+st.sidebar.caption(
+    "Registration and attendance data are stored in SQLite, "
+    "so Streamlit page refreshes do not clear them."
+)
+
 
 # ============================================================
 # DASHBOARD
 # ============================================================
 
 if page == "Dashboard":
-    st.title("🎓 College Attendance Dashboard")
+    st.title("🎓 Smart Attendance System")
 
-    today = date.today().strftime("%d-%m-%Y")
-    present_count = 0
+    today_display = date.today().strftime("%d-%m-%Y")
+    attendance_today = get_today_attendance()
 
-    if os.path.exists(EXCEL_FILE):
-        try:
-            wb = load_workbook(EXCEL_FILE, data_only=True)
-            ws = wb["Attendance"]
-            today_column = None
-
-            for col in range(1, ws.max_column + 1):
-                if ws.cell(row=1, column=col).value == today:
-                    today_column = col
-                    break
-
-            if today_column:
-                for row in range(2, ws.max_row + 1):
-                    if (
-                        ws.cell(row=row, column=today_column).value
-                        == "PRESENT"
-                    ):
-                        present_count += 1
-        except Exception:
-            pass
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Registered Students", len(students))
-    col2.metric("Present Today", present_count)
-    col3.metric("Attendance Date", today)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Registered Students", len(students))
+    c2.metric("Present Today", len(attendance_today))
+    c3.metric("Date", today_display)
 
     st.divider()
+
     st.info(
-        "Register students using the camera, then take or upload "
-        "a single/group photo in Attendance."
+        "Register each student once using five face photos. "
+        "Then capture or upload one class group photo in Attendance. "
+        "Recognized students are automatically marked PRESENT for today's date."
     )
+
+    if students:
+        rows = []
+        for student in students:
+            record = attendance_today.get(student["id"])
+            rows.append(
+                {
+                    "College ID": student["college_id"],
+                    "Name": student["name"],
+                    "Year": student["year"],
+                    "Status": "PRESENT" if record else "—"
+                }
+            )
+
+        st.subheader("Today's Attendance")
+        st.dataframe(
+            rows,
+            use_container_width=True,
+            hide_index=True
+        )
 
 
 # ============================================================
@@ -530,145 +776,212 @@ elif page == "Student Registration":
     st.title("👨‍🎓 Student Registration")
 
     st.write(
-        "No photo upload is required. Use the camera to capture "
-        "3 to 5 photos of the same person from different angles."
+        "Enter the student details and capture exactly five photos "
+        "using the device camera."
     )
 
     st.info(
-        "Recommended: Photo 1 = front, Photo 2 = turn left, "
-        "Photo 3 = turn right. Photos 4 and 5 are optional."
+        "Recommended order: Front → Slight Left → Slight Right → "
+        "Slight Up → Slight Down. Only one person should appear "
+        "in each photo."
     )
 
-    name = st.text_input("Student Name", key="reg_name")
+    registration_round = st.session_state.get(
+        "registration_round",
+        0
+    )
+
+    name = st.text_input(
+        "Student Name",
+        key=f"reg_name_{registration_round}"
+    )
+
     college_id = st.text_input(
         "College ID / Roll Number",
-        key="reg_college_id"
+        key=f"reg_id_{registration_round}"
     )
-    branch = st.text_input("Branch", key="reg_branch")
+
     year = st.selectbox(
         "Year",
-        ["1st Year", "2nd Year", "3rd Year", "4th Year"],
-        key="reg_year"
+        [
+            "1st Year",
+            "2nd Year",
+            "3rd Year",
+            "4th Year"
+        ],
+        key=f"reg_year_{registration_round}"
     )
-    section = st.text_input("Section", key="reg_section")
 
-    st.subheader("Capture Face Photos")
+    branch = st.text_input(
+        "Branch (optional)",
+        key=f"reg_branch_{registration_round}"
+    )
 
-    instructions = [
-        "Photo 1 — Look straight at the camera",
-        "Photo 2 — Turn your face slightly left",
-        "Photo 3 — Turn your face slightly right",
-        "Photo 4 — Optional: slight upward angle",
-        "Photo 5 — Optional: slight downward angle"
+    section = st.text_input(
+        "Section (optional)",
+        key=f"reg_section_{registration_round}"
+    )
+
+    st.subheader("Capture Five Facial Photos")
+
+    camera_labels = [
+        "Photo 1 — Look straight",
+        "Photo 2 — Turn slightly left",
+        "Photo 3 — Turn slightly right",
+        "Photo 4 — Look slightly up",
+        "Photo 5 — Look slightly down"
     ]
 
     camera_photos = []
-    for i in range(MAX_REGISTRATION_PHOTOS):
+
+    for index, label in enumerate(
+        camera_labels,
+        start=1
+    ):
         camera_photos.append(
             st.camera_input(
-                instructions[i],
-                key=f"registration_camera_{i + 1}"
+                label,
+                key=(
+                    f"reg_camera_"
+                    f"{registration_round}_"
+                    f"{index}"
+                )
             )
         )
 
+    captured_count = sum(
+        photo is not None
+        for photo in camera_photos
+    )
+
+    st.write(
+        f"**Photos captured: {captured_count}/5**"
+    )
+
     register_clicked = st.button(
         "✅ Register Student",
+        type="primary",
         use_container_width=True
     )
 
     if register_clicked:
-        if not name.strip():
+        clean_name = name.strip()
+        clean_id = college_id.strip()
+        clean_branch = branch.strip()
+        clean_section = section.strip()
+
+        if not clean_name:
             st.error("Please enter the student name.")
             st.stop()
 
-        if not college_id.strip():
+        if not clean_id:
             st.error("Please enter the College ID.")
             st.stop()
 
-        duplicate = any(
-            str(s.get("college_id", "")).strip()
-            == college_id.strip()
-            for s in students
-        )
-
-        if duplicate:
-            st.error("This College ID is already registered.")
-            st.stop()
-
-        captured = [p for p in camera_photos if p is not None]
-
-        if len(captured) < MIN_REGISTRATION_PHOTOS:
+        if college_id_exists(clean_id):
             st.error(
-                "Please capture at least 3 photos using the camera."
+                "This College ID is already registered."
             )
             st.stop()
 
-        new_embeddings = []
-        valid_photos = 0
+        if captured_count != REGISTRATION_PHOTOS:
+            st.error(
+                "Exactly five facial photos are required."
+            )
+            st.stop()
 
-        for index, photo in enumerate(captured, start=1):
-            image = prepare_image(photo.getvalue())
+        embeddings_for_student = []
+        registration_ok = True
+
+        progress = st.progress(0)
+        status = st.empty()
+
+        for index, photo in enumerate(
+            camera_photos,
+            start=1
+        ):
+            status.info(
+                f"Processing registration photo {index}/5..."
+            )
+
+            image = prepare_image(
+                photo.getvalue()
+            )
 
             if image is None:
-                st.warning(
+                st.error(
                     f"Photo {index} could not be read. Please retake it."
                 )
-                continue
+                registration_ok = False
+                break
 
-            embedding, error = create_embedding(image)
+            embedding, error = create_embedding(
+                image
+            )
 
             if embedding is None:
-                st.warning(f"Photo {index} skipped: {error}")
-                continue
+                st.error(
+                    f"Photo {index}: {error}"
+                )
+                registration_ok = False
+                break
 
-            new_embeddings.append(embedding)
-            valid_photos += 1
-
-        if valid_photos < MIN_REGISTRATION_PHOTOS:
-            st.error(
-                "Registration failed. At least 3 valid single-person "
-                "camera photos are required."
+            embeddings_for_student.append(
+                embedding
             )
-            st.info(
-                "Make sure only one person is visible, the face is well "
-                "lit, and the full face is inside the camera frame."
+
+            progress.progress(
+                index / REGISTRATION_PHOTOS
+            )
+
+        status.empty()
+        progress.empty()
+
+        # Nothing is written until all five photos pass validation.
+        if not registration_ok:
+            st.error(
+                "Registration cancelled. No partial student record was saved."
             )
             st.stop()
 
-        new_student_id = "student_" + college_id.strip()
-
-        student_data = {
-            "student_id": new_student_id,
-            "college_id": college_id.strip(),
-            "name": name.strip(),
-            "college_name": "CPU",
-            "branch": branch.strip(),
-            "year": year,
-            "section": section.strip()
-        }
-
-        students.append(student_data)
-        embeddings[new_student_id] = new_embeddings
-
-        save_students(students)
-        save_embeddings(embeddings)
-
         try:
-            sync_students_to_excel(students)
-        except PermissionError:
-            st.warning(
-                "Student was registered, but Attendance.xlsx is open. "
-                "Close Excel and try again to sync the sheet."
+            save_student(
+                clean_id,
+                clean_name,
+                year,
+                clean_branch,
+                clean_section,
+                embeddings_for_student
             )
 
-        st.success(
-            f"{name.strip()} has been registered successfully."
-        )
-        st.info(
-            f"{valid_photos} face embeddings were saved. "
-            "The registration photos themselves are not stored."
-        )
-        st.rerun()
+            excel_ok, excel_message = rebuild_excel()
+
+            st.success(
+                f"{clean_name} registered successfully."
+            )
+            st.info(
+                "Five SFace face embeddings have been saved. "
+                "Registration photos are not stored."
+            )
+
+            if not excel_ok:
+                st.warning(excel_message)
+
+            # Change widget keys so the next registration starts fresh.
+            st.session_state.registration_round = (
+                registration_round + 1
+            )
+            st.rerun()
+
+        except sqlite3.IntegrityError:
+            st.error(
+                "This College ID is already registered."
+            )
+        except Exception as e:
+            st.error(
+                "Registration could not be completed."
+            )
+            st.code(str(e))
 
 
 # ============================================================
@@ -676,134 +989,200 @@ elif page == "Student Registration":
 # ============================================================
 
 elif page == "Attendance":
-    st.title("📸 Mark Attendance")
+    st.title("📸 Automatic Group Attendance")
 
-    st.write(
-        "Upload or capture one photo. Every detected face is checked "
-        "against all registered students."
-    )
+    if not students:
+        st.warning(
+            "No students are registered yet. Register students first."
+        )
+    else:
+        st.write(
+            "Upload or capture one class/group photo. The system will "
+            "detect every face, identify registered students, draw a box "
+            "with their name, label non-registered faces as Unknown, and "
+            "automatically mark every recognized student PRESENT for today's date."
+        )
 
-    uploaded = st.file_uploader(
-        "Upload Attendance Photo",
-        type=["jpg", "jpeg", "png"],
-        key="attendance_upload"
-    )
+        uploaded = st.file_uploader(
+            "Upload Group Photo",
+            type=["jpg", "jpeg", "png"],
+            key="attendance_upload"
+        )
 
-    camera = st.camera_input(
-        "Or take an Attendance Photo",
-        key="attendance_camera"
-    )
+        camera = st.camera_input(
+            "Or take a Group Attendance Photo",
+            key="attendance_camera"
+        )
 
-    selected_file = uploaded if uploaded is not None else camera
+        selected_file = (
+            uploaded
+            if uploaded is not None
+            else camera
+        )
 
-    if selected_file is not None:
-        image = prepare_image(selected_file.getvalue())
+        if selected_file is not None:
+            file_bytes = selected_file.getvalue()
+            image = prepare_image(file_bytes)
 
-        if image is None:
-            st.error("Unable to read this image.")
-            st.stop()
+            if image is None:
+                st.error("Unable to read the image.")
+                st.stop()
 
-        faces = detect_faces(image)
+            faces = detect_faces(image)
 
-        if len(faces) == 0:
-            st.warning(
-                "No faces were detected. Please use a clearer photo "
-                "with faces visible and well lit."
+            if not faces:
+                st.warning(
+                    "No faces were detected. Use a clearer group photo "
+                    "with faces visible and reasonably well lit."
+                )
+                st.stop()
+
+            st.info(
+                f"{len(faces)} face(s) detected."
             )
-            st.stop()
 
-        st.info(f"{len(faces)} face(s) detected.")
+            annotated = image.copy()
+            result_rows = []
+            recognized_students = {}
+            recognized_scores = {}
 
-        annotated = image.copy()
-        recognized_students = {}
-        result_rows = []
-
-        for face in faces:
-            student_id, score, _ = recognize_face(
-                image,
-                face,
-                embeddings
-            )
-
-            if student_id is not None:
-                student = next(
-                    (
-                        s for s in students
-                        if s.get("student_id") == student_id
-                    ),
-                    None
+            for face in faces:
+                student_id, score, _ = recognize_face(
+                    image,
+                    face,
+                    stored_embeddings
                 )
 
-                if student is not None:
-                    name_value = student.get("name", "Unknown")
-                    recognized_students[student_id] = student
+                if student_id is not None:
+                    student = get_student(student_id)
 
-                    draw_face_label(
-                        annotated,
-                        face,
-                        name_value,
-                        score
-                    )
+                    if student is not None:
+                        # Same student may appear more than once; use strongest match.
+                        recognized_students[student_id] = student
+                        recognized_scores[student_id] = max(
+                            score,
+                            recognized_scores.get(student_id, -1.0)
+                        )
 
-                    result_rows.append({
-                        "Student": name_value,
-                        "College ID": student.get("college_id", ""),
-                        "Result": "Recognized"
-                    })
-                    continue
+                        draw_face_label(
+                            annotated,
+                            face,
+                            student["name"],
+                            score
+                        )
 
-            draw_face_label(annotated, face, "Unknown")
-            result_rows.append({
-                "Student": "Unknown",
-                "College ID": "",
-                "Result": "Not Registered"
-            })
+                        result_rows.append(
+                            {
+                                "Student": student["name"],
+                                "College ID": student["college_id"],
+                                "Similarity": round(score, 3),
+                                "Result": "Recognized"
+                            }
+                        )
+                        continue
 
-        st.subheader("Face Recognition Result")
+                draw_face_label(
+                    annotated,
+                    face,
+                    "Unknown"
+                )
 
-        st.image(
-            cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
-            caption="Detected faces and recognition result",
-            use_container_width=True
-        )
+                result_rows.append(
+                    {
+                        "Student": "Unknown",
+                        "College ID": "",
+                        "Similarity": "",
+                        "Result": "Not Registered"
+                    }
+                )
 
-        st.dataframe(
-            result_rows,
-            use_container_width=True,
-            hide_index=True
-        )
-
-        if recognized_students:
-            st.success(
-                f"{len(recognized_students)} registered student(s) recognized."
+            st.subheader("Face Recognition Result")
+            st.image(
+                cv2.cvtColor(
+                    annotated,
+                    cv2.COLOR_BGR2RGB
+                ),
+                caption=(
+                    "Green box = recognized registered student | "
+                    "Red box = Unknown"
+                ),
+                use_container_width=True
             )
 
-            if st.button(
-                "✅ Mark Recognized Students Present",
+            st.dataframe(
+                result_rows,
                 use_container_width=True,
-                key="mark_attendance_button"
-            ):
-                success, result = save_attendance(
-                    recognized_students,
-                    students
+                hide_index=True
+            )
+
+            attendance_date = date.today().isoformat()
+            attendance_display = date.today().strftime(
+                "%d-%m-%Y"
+            )
+
+            if recognized_students:
+                # Prevent repeated Streamlit reruns from producing repeated messages.
+                photo_token = hashlib.sha256(
+                    file_bytes
+                ).hexdigest()
+                attendance_token = (
+                    attendance_date + ":" + photo_token
                 )
 
-                if success:
-                    st.success(
-                        f"Attendance marked successfully for {result} student(s)."
+                already_processed = (
+                    st.session_state.get(
+                        "last_attendance_token"
                     )
-                    st.info(
-                        "Faces that were not recognized were left blank "
-                        "and were not marked absent."
-                    )
+                    == attendance_token
+                )
+
+                new_count = 0
+                already_count = 0
+
+                if not already_processed:
+                    for student_id in recognized_students:
+                        result = mark_present(
+                            student_id,
+                            attendance_date,
+                            recognized_scores[student_id]
+                        )
+
+                        if result == "NEW":
+                            new_count += 1
+                        else:
+                            already_count += 1
+
+                    st.session_state[
+                        "last_attendance_token"
+                    ] = attendance_token
+
+                    excel_ok, excel_message = rebuild_excel()
+
+                    if new_count:
+                        st.success(
+                            f"{new_count} student(s) automatically marked "
+                            f"PRESENT for {attendance_display}."
+                        )
+
+                    if already_count:
+                        st.info(
+                            f"{already_count} student(s) were already PRESENT "
+                            "today. No duplicate attendance was created."
+                        )
+
+                    if not excel_ok:
+                        st.warning(excel_message)
                 else:
-                    st.error(
-                        f"Attendance could not be saved: {result}"
+                    st.success(
+                        f"Attendance already processed for this photo today. "
+                        f"Recognized students are PRESENT for {attendance_display}."
                     )
-        else:
-            st.warning(
-                "No registered student was confidently recognized."
-            )
+
+            else:
+                st.warning(
+                    "No registered student was confidently recognized. "
+                    "No attendance was marked."
+                )
 
 
 # ============================================================
@@ -812,6 +1191,8 @@ elif page == "Attendance":
 
 elif page == "Registered Students":
     st.title("👨‍🎓 Registered Students")
+
+    students = get_students()
 
     if not students:
         st.info("No students are registered yet.")
@@ -822,34 +1203,32 @@ elif page == "Registered Students":
 
         filtered = []
         for student in students:
-            student_name = str(student.get("name", "")).lower()
-            student_id = str(student.get("college_id", "")).lower()
-
             if (
                 not search
-                or search in student_name
-                or search in student_id
+                or search in student["name"].lower()
+                or search in student["college_id"].lower()
             ):
                 filtered.append(student)
 
-        st.write(f"Showing {len(filtered)} student(s).")
+        st.write(
+            f"Showing {len(filtered)} student(s)."
+        )
 
         for student in filtered:
             with st.container(border=True):
-                st.subheader(student.get("name", ""))
-
+                st.subheader(student["name"])
                 c1, c2, c3, c4 = st.columns(4)
                 c1.write(
-                    f"**College ID**\n\n{student.get('college_id', '')}"
+                    "**College ID**\n\n" + student["college_id"]
                 )
                 c2.write(
-                    f"**Branch**\n\n{student.get('branch', '')}"
+                    "**Year**\n\n" + student["year"]
                 )
                 c3.write(
-                    f"**Year**\n\n{student.get('year', '')}"
+                    "**Branch**\n\n" + (student["branch"] or "—")
                 )
                 c4.write(
-                    f"**Section**\n\n{student.get('section', '')}"
+                    "**Section**\n\n" + (student["section"] or "—")
                 )
 
 
@@ -860,35 +1239,35 @@ elif page == "Registered Students":
 elif page == "Attendance Records":
     st.title("📊 Attendance Records")
 
-    if not os.path.exists(EXCEL_FILE):
-        st.info("No attendance records are available yet.")
-    else:
-        try:
-            wb = load_workbook(EXCEL_FILE, data_only=True)
-            ws = wb["Attendance"]
+    records = get_attendance_records()
 
-            headers = [
-                ws.cell(row=1, column=col).value
-                for col in range(1, ws.max_column + 1)
-            ]
-
-            records = []
-            for row in range(2, ws.max_row + 1):
-                record = {}
-                for col, header in enumerate(headers, start=1):
-                    record[str(header)] = ws.cell(
-                        row=row,
-                        column=col
-                    ).value
-                records.append(record)
-
-            st.dataframe(
-                records,
-                use_container_width=True,
-                hide_index=True
+    if records:
+        table = []
+        for row in records:
+            table.append(
+                {
+                    "College ID": row[0],
+                    "Name": row[1],
+                    "Year": row[2],
+                    "Branch": row[3],
+                    "Section": row[4],
+                    "Date": row[5],
+                    "Status": row[6],
+                    "Similarity": round(row[7], 3)
+                }
             )
 
-            with open(EXCEL_FILE, "rb") as f:
+        st.dataframe(
+            table,
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("No attendance records are available yet.")
+
+    if os.path.exists(EXCEL_PATH):
+        try:
+            with open(EXCEL_PATH, "rb") as f:
                 st.download_button(
                     "⬇️ Download Attendance Excel",
                     data=f,
@@ -898,7 +1277,10 @@ elif page == "Attendance Records":
                         "spreadsheetml.sheet"
                     )
                 )
+        except Exception:
+            pass
 
-        except Exception as e:
-            st.error("Unable to read attendance records.")
-            st.code(str(e))
+    st.caption(
+        "Only recognized students are marked PRESENT. Faces not recognized "
+        "in a group photo are left without attendance; they are not marked absent."
+    )
